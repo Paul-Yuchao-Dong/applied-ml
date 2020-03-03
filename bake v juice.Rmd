@@ -1,0 +1,94 @@
+---
+title: "Bake vs Juice"
+author: "Paul"
+date: '`r format(Sys.Date(), "%d\\. %m\\. %Y")`'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+options(mc.cores = parallel::detectCores())
+library(tidyverse)
+theme_set(hrbrthemes::theme_ipsum(base_family = "Arial_Narrow"))
+```
+# Did Recipe save the function parameter used?
+
+## Simple Data
+```{r}
+df_train <- data.frame(
+  x = 1:3,
+  y = 4:6
+)
+
+df_test <- data.frame(
+  x = 4:6,
+  y = 7:9
+)
+```
+
+## Prepare recipe with training data
+```{r}
+library(recipes)
+```
+
+```{r}
+try_rec <- recipes::recipe(
+  y ~ x, data = df_train
+) %>% 
+  step_normalize(all_predictors()) %>% 
+  prep()
+```
+
+## See the result on test data
+
+```{r}
+juice(try_rec)
+```
+```{r}
+bake(try_rec, new_data = df_test)
+```
+# Perfect!
+Recipes does exactly what it is supposed to do!
+
+It used the normalizing parameter fitted from training data onto the normalizing of the testing data!
+
+# What is the difference between using prep or not?
+
+```{r}
+try_rec_unpreped <- try_rec %>% 
+  step_nzv(x) 
+```
+```{r}
+try_rec_unpreped %>% prep%>% juice
+```
+```{r}
+try_rec_unpreped %>% prep %>% bake(new_data = df_test)
+
+```
+
+# Also see if the response can be standardized well
+```{r}
+try_rec <- recipes::recipe(
+  y ~ x, data = df_train
+) %>% 
+  step_normalize(all_numeric()) %>% 
+  prep()
+```
+
+## See the result on test data
+
+```{r}
+juice(try_rec)
+```
+```{r}
+bake(try_rec, new_data = df_test)
+```
+# this also worked!

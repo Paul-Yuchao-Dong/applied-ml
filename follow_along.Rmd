@@ -1,0 +1,480 @@
+---
+title: "Applied Machine Learning rConf2020"
+author: "Paul"
+date: '`r format(Sys.Date(), "%d\\. %m\\. %Y")`'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+options(mc.cores = parallel::detectCores())
+library(tidyverse)
+theme_set(hrbrthemes::theme_ipsum(base_family = "Arial_Narrow"))
+library(tidymodels)
+```
+
+```{r}
+library(AmesHousing)
+```
+```{r}
+ames <- make_ames() %>% 
+  #remove quality-related predictors
+  select(-contains("Qu"))
+nrow(ames)
+```
+```{r}
+set.seed(4595)
+data_split <- initial_split(ames, strata = "Sale_Price")
+ames_train <- training(data_split)
+ames_test <- testing(data_split)
+nrow(ames_train) / nrow(ames)
+```
+```{r}
+View(ames_train)
+```
+# Specifying models
+
+## start simple
+
+```{r}
+simple_lm <- lm(log10(Sale_Price)~Longitude+Latitude, data = ames_train)
+simple_lm_values <- augment(simple_lm)
+names(simple_lm_values)
+```
+```{r}
+head(simple_lm_values, 2)
+```
+```{r}
+tidy(simple_lm)
+```
+```{r}
+glance(simple_lm)
+```
+
+## to solve different interface, parsnip
+
+```{r}
+spec_lin_reg <- linear_reg()
+lm_mod <- spec_lin_reg %>% set_engine("lm")
+```
+```{r}
+lm_fit <- fit(
+  lm_mod,
+  log10(Sale_Price) ~ Longitude + Latitude,
+  data = ames_train
+)
+```
+```{r}
+fit_xy(
+  lm_mod,
+  y = ames_train$Sale_Price %>% log10,
+  x = ames_train %>% select(Longitude,Latitude)
+)
+```
+```{r}
+spec_stan <- spec_lin_reg %>% 
+  set_engine("stan", chains = 4, iter = 1000)
+```
+```{r}
+fit_stan <- fit(
+  spec_stan,
+  log10(Sale_Price) ~ Longitude + Latitude,
+  data = ames_train
+)
+```
+```{r}
+fit_stan$fit
+```
+```{r}
+lm_fit$fit
+```
+```{r}
+fit_knn <- nearest_neighbor(mode = "regression", neighbors = 5) %>% 
+  set_engine("kknn") %>% 
+  fit(
+    log10(Sale_Price) ~ Longitude + Latitude,
+    data = ames_train
+  )
+fit_knn
+```
+# Predictions (not suggested, just for show)
+need to do cross validation, etc.
+```{r}
+test_pred <- lm_fit %>% 
+  predict(ames_test) %>% 
+  bind_cols(ames_test) %>% 
+  mutate(log_price = log10(Sale_Price))
+
+test_pred %>% 
+  select(.pred, log_price) %>% 
+  head
+```
+
+```{r}
+test_pred <- fit_knn %>% # just change one thing  
+  predict(ames_test) %>% 
+  bind_cols(ames_test) %>% 
+  mutate(log_price = log10(Sale_Price))
+
+test_pred %>% 
+  select(.pred, log_price) %>% 
+  head
+
+```
+
+```{r}
+test_pred <- fit_stan %>% 
+  predict(ames_test) %>% 
+  bind_cols(ames_test) %>% 
+  mutate(log_price = log10(Sale_Price))
+
+test_pred %>% 
+  select(.pred, log_price) %>% 
+  head
+
+```
+
+# Performance estimation
+
+```{r}
+perf_matrics <- metric_set(rmse, rsq, ccc)
+test_pred %>% perf_matrics(truth = log_price, estimate = .pred)
+```
+
+```{r}
+model.matrix(~Alley+0, ames)
+```
+```{r}
+ames_train %>% 
+  count(Neighborhood, sort = TRUE) %>%
+  mutate(Neighborhood = fct_reorder(Neighborhood,n)) %>% 
+  ggplot(aes(Neighborhood,n))+
+  geom_col()+
+  coord_flip()+
+  NULL
+```
+
+# Preprocess
+
+```{r}
+mod_rec <- recipe(
+  Sale_Price ~ Longitude + Latitude + Neighborhood,
+  data = ames_train
+) %>% 
+  step_log(Sale_Price, base = 10) %>% 
+  # step_zv(Neighborhood) %>%
+  step_other(Neighborhood, threshold = 0.05) %>% 
+  step_dummy(all_nominal())
+
+mod_rec
+```
+
+```{r}
+mod_rec_trained <- prep(mod_rec, training = ames_train, verbose = TRUE)
+```
+```{r}
+juice(mod_rec_trained)
+```
+```{r}
+bake(mod_rec_trained,new_data = ames_test)
+```
+
+## Interactions
+
+```{r}
+ames_train %>% 
+  ggplot(aes(Year_Built, Sale_Price))+
+  geom_point(alpha=0.5)+
+  geom_smooth()+
+  scale_y_log10()+
+  NULL
+```
+```{r}
+ames_train %>% 
+  ggplot(aes(Year_Built, Sale_Price))+
+  geom_point(alpha=0.5)+
+  geom_smooth(method = "lm")+
+  scale_y_log10()+
+  facet_wrap(~Central_Air, nrow = 2)+
+  NULL
+
+```
+## Interactions
+```{r}
+interact_rec <- recipe(
+  Sale_Price  ~ Year_Built + Central_Air,
+  data = ames_train
+) %>% 
+  step_log(Sale_Price) %>% 
+  step_dummy(Central_Air) %>% 
+  step_interact(~starts_with("Central_Air"):Year_Built)
+
+interact_rec %>% 
+  prep(training = ames_train) %>% 
+  juice %>% 
+  slice(153:157)
+```
+
+# PCA part mostly talk, only box-cox sticked
+
+# Recipe and models
+
+```{r}
+bs_smooth <- function(data, xvar){
+  ggplot(data, aes({{xvar}}, Sale_Price))+
+    geom_point(alpha = 0.5)+
+    scale_y_log10()+
+    geom_smooth(method = "lm",formula = y ~ splines::bs(x,5))+
+    NULL
+}
+```
+```{r}
+ames_train %>% 
+  bs_smooth(Longitude)
+```
+
+```{r}
+ames_train %>% 
+  bs_smooth(Latitude)
+
+```
+
+```{r}
+ames_rec <- recipe(
+  Sale_Price ~ Bldg_Type + Neighborhood + Year_Built +
+    Gr_Liv_Area + Full_Bath + Year_Sold + Lot_Area +
+    Central_Air + Longitude + Latitude,
+  data = ames_train
+) %>% 
+  step_log(Sale_Price, base = 10) %>% 
+  step_BoxCox(Lot_Area, Gr_Liv_Area) %>% 
+  step_other(Neighborhood, threshold = 0.05) %>% 
+  step_dummy(all_nominal()) %>% 
+  step_interact(~starts_with("Central_Air"):Year_Built) %>%
+  step_ns(Longitude, Latitude, deg_free = 5) %>% 
+  prep()
+
+```
+
+```{r}
+stan_lm_fit <- 
+  spec_stan %>% 
+  fit(Sale_Price ~., data = juice(ames_rec))
+
+glance(stan_lm_fit$fit)
+```
+```{r}
+ames_test_processed <- bake(ames_rec, ames_test)
+ames_test_processed
+```
+
+# Do not use the test data yet! Validation incomplete!
+```{r}
+predict(stan_lm_fit, new_data = ames_test_processed)
+```
+```{r}
+ames_wfl <- workflow() %>% 
+  add_recipe(ames_rec) %>% 
+  # add_model(spec_stan) %>%
+  add_model(lm_mod)
+ames_wfl
+```
+
+```{r}
+aes_wfl_fit <- fit(ames_wfl, ames_train)
+predict(aes_wfl_fit, ames_test)
+```
+
+# Cross Validation
+
+```{r}
+set.seed(2453)
+cv_splits <- vfold_cv(ames_train)
+cv_splits
+```
+```{r}
+cv_splits$splits[[1]] %>% 
+  analysis() %>% 
+  dim
+
+cv_splits$splits[[1]] %>% 
+  assessment() %>% 
+  dim
+
+```
+
+## Use KNN here, will try 
+
+```{r}
+knn_mod <- 
+  nearest_neighbor(neighbors = 5) %>% 
+  set_engine("kknn") %>% 
+  set_mode("regression")
+
+knn_wfl <- 
+  workflow() %>% 
+  add_model(knn_mod) %>% 
+  add_formula(log10(Sale_Price) ~ Longitude + Latitude)
+```
+## if skip CV
+```{r}
+knn_wfl %>% 
+  fit(data = ames_train)
+```
+## Now with CV
+```{r}
+knn_res <- cv_splits %>% 
+  mutate(workplows = map(splits, ~ fit(knn_wfl, data = analysis(.x))))
+knn_res
+```
+```{r}
+with(knn_res,  
+  { map2_dfr(workplows, splits,
+           ~ predict(.x, assessment(.y)),
+           .id = "fold"
+           )
+  })
+```
+```{r}
+knn_pred <- knn_res %>% 
+  group_modify(~map2_dfr(.$workplows, .$splits,
+           ~ predict(.x, assessment(.y)),
+           .id = "fold"
+           )
+  )
+
+prices <- knn_res %>% 
+  group_modify(
+    ~map_dfr(.$splits,
+             ~ assessment(.x) %>% select(Sale_Price)
+             )
+  ) %>% 
+  mutate(Sale_Price = log10(Sale_Price))
+
+rmse_est <- knn_pred %>% 
+  bind_cols(prices) %>% 
+  group_by(fold) %>% 
+  group_modify(~rmse(., Sale_Price, .pred))
+
+mean(rmse_est$.estimate)
+```
+```{r}
+easy_eval <- fit_resamples(
+  knn_wfl,
+  resamples = cv_splits,
+  control = control_resamples(save_pred = TRUE)
+)
+```
+```{r}
+easy_eval %>% 
+  collect_predictions()
+```
+```{r}
+easy_eval %>% 
+  collect_metrics()
+```
+```{r}
+easy_eval %>% 
+  collect_metrics(summarize = FALSE)
+
+```
+
+```{r}
+cv_fit_lm <- fit_resamples(
+  ames_wfl,
+  resamples = cv_splits,
+  control = control_resamples(save_pred = TRUE)
+)
+```
+```{r}
+cv_fit_lm %>% 
+  collect_metrics()
+```
+```{r}
+penalty()
+```
+```{r}
+mixture()
+```
+```{r}
+glmn_param <- parameters(penalty(), mixture())
+glmn_param
+```
+```{r}
+glmn_grid <- 
+  glmn_param %>% 
+  grid_regular(levels = c(10,5))
+glmn_grid
+```
+
+```{r}
+set.seed(7454)
+glmn_sfd <- 
+  glmn_param %>% 
+  grid_max_entropy(size = 50)
+glmn_sfd
+```
+
+```{r}
+mtry()
+```
+```{r}
+rf_set <- parameters(mtry(), trees())
+rf_set
+```
+```{r}
+finalize(rf_set, mtcars %>% select(-mpg))
+```
+```{r}
+?nearest_neighbor
+```
+```{r}
+knn_set <- parameters(neighbors(), dials::dist_power(), dials::weight_func()) %>% 
+  grid_max_entropy(size = 4^3)
+knn_set %>% 
+  ggplot(aes(neighbors, dist_power, color = weight_func))+
+  geom_point()
+```
+
+```{r}
+knn_mod <- 
+  nearest_neighbor(neighbors = tune(), weight_func = tune()) %>% 
+  set_engine("kknn") %>% 
+  set_mode("regression")
+```
+```{r}
+parameters(knn_mod)
+```
+```{r}
+nearest_neighbor(neighbors = tune("K"), weight_func = tune("weights")) %>% 
+  set_engine("kknn") %>% 
+  set_mode("regression") %>% 
+  parameters()
+
+```
+```{r}
+knn_grid <- knn_mod %>% 
+  parameters() %>% 
+  grid_regular(levels = c(15, 5))
+
+control <- control_grid(verbose = TRUE)
+
+knn_tune <- tune_grid(
+  ames_rec,
+  model = knn_mod,
+  resamples = cv_splits,
+  grid = knn_grid,
+  control = control
+)
+```
+```{r}
+show_best(knn_tune, metric = "rmse", maximize = FALSE)
+```

@@ -1,0 +1,276 @@
+---
+title: "Regression"
+author: "Paul"
+date: '`r format(Sys.Date(), "%d\\. %m\\. %Y")`'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+options(mc.cores = parallel::detectCores())
+library(tidyverse)
+theme_set(hrbrthemes::theme_ipsum(base_family = "Arial_Narrow"))
+library(tidymodels)
+```
+```{r}
+data("Chicago")
+```
+```{r}
+us_hol <- timeDate::listHolidays() %>% 
+  str_subset("(^US)|(Easter)")
+```
+```{r}
+chi_rec <- 
+  recipe(ridership ~ ., data = Chicago) %>% 
+  step_holiday(date, holidays = us_hol) %>% 
+  step_date(date) %>% 
+  step_rm(date) %>% 
+  step_dummy(recipes::all_nominal()) %>% 
+  step_zv(recipes::all_predictors()) 
+  # step_normalize(one_of(!!stations))
+  # step_pca(one_of(!!stations), num_comp = tune())
+```
+
+```{r}
+chi_folds <- rolling_origin(
+  Chicago,
+  initial = 364 * 15,
+  assess = 4*7,
+  skip = 4*7,
+  cumulative = FALSE
+)
+```
+```{r}
+dim(analysis(chi_folds$splits[[1]]))
+```
+
+# humble beginnings
+
+```{r}
+lm(ridership ~ . - date, data = Chicago)
+```
+```{r}
+glmn_grid <- 
+  expand.grid(
+    penalty = 10^seq(-3,-1, length = 20),
+    mixture = (0:5)/5
+  )
+```
+```{r}
+glmn_rec <- chi_rec %>% 
+  step_normalize(recipes::all_predictors())
+
+glmn_mod <- linear_reg(penalty = tune(), mixture = tune()) %>% 
+  set_engine("glmnet")
+
+ctrl <- control_grid(save_pred = TRUE)
+
+
+```
+
+## Parallel this!
+
+```{r}
+num_cores <- parallel::detectCores()
+library(doParallel)
+```
+
+
+```{r}
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+glmn_tune <- tune_grid(
+  glmn_rec,
+  model = glmn_mod,
+  resamples = chi_folds,
+  grid = glmn_grid,
+  control = ctrl
+)
+
+stopCluster(cl)
+```
+```{r}
+glmn_tune %>% 
+  collect_metrics() %>% 
+  filter(.metric == "rmse") ->
+  rmse_vals
+```
+```{r}
+show_best(glmn_tune, "rmse", maximize = FALSE)
+```
+
+```{r}
+rmse_vals %>% 
+  mutate(mixture = format(mixture)) %>% 
+  ggplot(aes(penalty, mean, color = mixture))+
+  geom_line()+
+  geom_point()+
+  scale_x_log10()+
+  NULL
+```
+
+```{r}
+best_glmn <- 
+  select_best(glmn_tune, metric = "rmse", maximize = FALSE)
+best_glmn
+```
+
+```{r}
+glmn_pred <- glmn_tune %>% 
+  collect_predictions()
+
+glmn_pred <- 
+  glmn_pred %>% 
+  inner_join(best_glmn, by = c("mixture", "penalty"))
+glmn_pred %>% 
+  ggplot(aes(.pred, ridership))+
+  geom_abline(col = "green")+
+  geom_point(alpha = 0.3)+
+  coord_equal()+
+  NULL
+```
+
+## Investigate the large errors
+
+```{r}
+large_resid <- 
+  glmn_pred %>% 
+  mutate(resid = ridership - .pred) %>% 
+  arrange(desc(abs(resid))) %>% 
+  slice(1:4)
+
+Chicago %>% 
+  slice(large_resid$.row) %>% 
+  select(date) %>% 
+  mutate(day = lubridate::wday(date, label = TRUE)) %>% 
+  bind_cols(large_resid) %>% 
+  View
+```
+## Best model 
+```{r}
+glmn_rec_final <- prep(glmn_rec)
+glmn_mod_final <- finalize_model(glmn_mod, best_glmn)
+glmn_mod_final
+```
+```{r}
+glmn_fit <- 
+  glmn_mod_final %>% 
+  fit(ridership ~. , data = juice(glmn_rec_final))
+glmn_fit 
+```
+
+```{r}
+plot(glmn_fit$fit, xvar = "lambda")
+```
+
+```{r}
+library(vip)
+
+vip(glmn_fit, num_features = 20L, lambda = best_glmn$penalty)
+```
+
+# MARS model
+
+```{r}
+mars_mod <- mars(prod_degree = tune())
+
+mars_mod <- 
+  mars(num_terms = tune("mar terms"), prod_degree = tune(), prune_method = "none") %>% 
+  set_engine("earth") %>% 
+  set_mode("regression")
+
+tunable(mars_mod)
+
+mars_rec <- 
+  chi_rec %>% 
+  step_normalize(one_of(!!stations)) %>% 
+  step_pca(one_of(!!stations), num_comp = tune("pca comps"))
+```
+
+```{r}
+chi_wfl <- 
+  workflow() %>% 
+  add_model(mars_mod) %>% 
+  add_recipe(mars_rec)
+
+chi_set <- 
+  parameters(chi_wfl) %>% 
+  update(
+    `pca comps` = num_comp(c(0, 20)),
+    `mar terms` = num_terms(c(2, 100))
+  )
+```
+
+```{r}
+library(doMC)
+
+```
+
+```{r}
+registerDoMC(cores = num_cores)
+
+ctrl <- control_bayes(verbose = TRUE, save_pred = TRUE)
+
+set.seed(7891)
+mars_tune <- 
+  tune_bayes(
+    chi_wfl,
+    resamples = chi_folds,
+    iter = 25,
+    param_info = chi_set,
+    metrics = metric_set(rmse),
+    initial = 4,
+    control = ctrl
+  )
+
+```
+
+```{r}
+autoplot(mars_tune,type = "performance")
+```
+
+```{r}
+autoplot(mars_tune,type = "marginals")
+
+```
+```{r}
+show_best(mars_tune, maximize = FALSE) %>% View
+```
+```{r}
+mars_pred <- 
+  mars_tune %>% 
+  collect_predictions() %>% 
+  inner_join(
+    select_best(mars_tune, maximize = FALSE),
+    by = c("mar terms", "pca comps")
+  )
+
+ggplot(mars_pred, aes(.pred, ridership))+
+  geom_abline(col = "green")+
+  geom_point(alpha = 0.3)+
+  coord_equal()
+```
+
+```{r}
+best_mars <- select_best(mars_tune, "rmse", maximize = FALSE)
+best_mars
+```
+```{r}
+final_mars_wfl <- finalize_workflow(chi_wfl, best_mars)
+final_mars_wfl <- fit(final_mars_wfl, data = Chicago)
+```
+```{r}
+final_mars_wfl %>% 
+  pull_workflow_fit() %>% 
+  vip(num_features = 20L, type = "gcv")
+```
+
